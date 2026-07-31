@@ -10,6 +10,43 @@ permissions:
   contents: read
 
 jobs:
+  test: 
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: 3.13
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run tests
+        run: pytest
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: 3.13
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run flake8
+        run: flake8 app.py --max-line-length=100
+
+  build-and-push:
+    needs: [test, lint]
+    runs-on: ubuntu-latest
   build-and-push:
     runs-on: ubuntu-latest
     steps:
@@ -38,7 +75,7 @@ jobs:
           docker build -t $REGISTRY/$REPOSITORY:$IMAGE_TAG .
           docker push $REGISTRY/$REPOSITORY:$IMAGE_TAG
 
-  deploy:
+  deploy: #deploy to EC2 instance
     needs: build-and-push
     runs-on: ubuntu-latest
     steps:
