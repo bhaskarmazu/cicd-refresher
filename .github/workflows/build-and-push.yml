@@ -88,12 +88,12 @@ jobs:
         uses: aws-actions/amazon-ecr-login@v2
 
       - name: Run Trivy scan
-        uses: aquasecurity/trivy-action@dc5a429b52fcf669ce959baa2c2dd26090d2a6c4  # v0.35.0 — pinned by commit SHA, unaffected by the March 2026 tag-hijack
+        uses: aquasecurity/trivy-action@dc5a429b52fcf669ce959baa2c2dd26090d2a6c4  # v0.35.0 — pinned by commit SHA
         with:
-        image-ref: ${{ steps.login-ecr.outputs.registry }}/githubactions-app:${{ github.sha }}
-        format: table
-        severity: CRITICAL,HIGH
-        exit-code: 1
+            image-ref: ${{ steps.login-ecr.outputs.registry }}/githubactions-app:${{ github.sha }}
+            format: table
+            severity: CRITICAL,HIGH
+            exit-code: 1
 
   deploy: #deploy to EC2 instance
     needs: scan
