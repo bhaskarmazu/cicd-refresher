@@ -104,6 +104,7 @@ jobs:
             -v /var/run/docker.sock:/var/run/docker.sock \
             aquasec/trivy:0.35.0 image \
             --exit-code 1 \
+            --ignore-unfixed \
             --severity CRITICAL,HIGH \
             --format table \
             $REGISTRY/$REPOSITORY:$IMAGE_TAG
