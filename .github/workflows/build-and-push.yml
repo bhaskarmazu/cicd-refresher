@@ -77,27 +77,36 @@ jobs:
           docker build -t $REGISTRY/$REPOSITORY:$IMAGE_TAG .
           docker push $REGISTRY/$REPOSITORY:$IMAGE_TAG
 
-  #scan: #container vulnerability scan (Trivy)
-  #  needs: build-and-push
-  #  runs-on: ubuntu-latest
-  #  steps:
-  #    - name: Configure AWS credentials via OIDC
-  #      uses: aws-actions/configure-aws-credentials@v4
-  #      with:
-  #        role-to-assume: arn:aws:iam::048280526216:role/github-actions-ecr-push
-  #        aws-region: us-east-1
-#
-  #    - name: Log in to Amazon ECR
-  #      id: login-ecr
-  #      uses: aws-actions/amazon-ecr-login@v2
-#
-  #    - name: Run Trivy scan
-  #      uses: aquasecurity/trivy-action@dc5a429b52fcf669ce959baa2c2dd26090d2a6c4  # v0.35.0 — pinned by commit SHA
-  #      with:
-  #         image-ref: ${{ steps.login-ecr.outputs.registry }}/githubactions-app:${{ github.sha }}
-  #          format: table
-  #          severity: CRITICAL,HIGH
-  #          exit-code: 1
+  scan:
+    needs: build-and-push
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::048280526216:role/github-actions-ecr-push
+          aws-region: us-east-1
+      - id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      - name: Pull image to scan
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          REPOSITORY: githubactions-app
+          IMAGE_TAG: ${{ github.sha }}
+        run: docker pull $REGISTRY/$REPOSITORY:$IMAGE_TAG
+      - name: Run Trivy scan (official Docker image, not the compromised Action)
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          REPOSITORY: githubactions-app
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            aquasec/trivy:0.35.0 image \
+            --exit-code 1 \
+            --severity CRITICAL,HIGH \
+            --format table \
+            $REGISTRY/$REPOSITORY:$IMAGE_TAG
 
   # deploy: #deploy to EC2 instance
   #   needs: build-and-push
@@ -160,7 +169,7 @@ jobs:
   #         curl -f http://${{ steps.get-ip.outputs.ip }}:5000
 # deploy in staging and production environments
   deploy-staging:
-    needs: build-and-push
+    needs: [build-and-push, scan]
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     environment: staging
@@ -222,6 +231,23 @@ jobs:
         with:
           role-to-assume: arn:aws:iam::048280526216:role/github-actions-ecr-push
           aws-region: us-west-2
+
+      - name: Get previous production tag
+        id: get-previous
+        env:
+          INSTANCE_ID: ${{ secrets.EC2_INSTANCE_ID }}
+        run: |
+          COMMAND_ID=$(aws ssm send-command \
+            --document-name "AWS-RunShellScript" \
+            --targets "Key=instanceIds,Values=$INSTANCE_ID" \
+            --parameters '{"commands":["cat /home/ec2-user/current-production-tag.txt 2>/dev/null || echo none"]}' \
+            --region us-west-2 \
+            --query "Command.CommandId" \
+            --output text)
+          aws ssm wait command-executed --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --region us-west-2 || true
+          PREV_TAG=$(aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --region us-west-2 --query "StandardOutputContent" --output text | tr -d '[:space:]')
+          echo "prev_tag=$PREV_TAG" >> "$GITHUB_OUTPUT"
+
       - name: Deploy new image via SSM
         env:
           INSTANCE_ID: ${{ secrets.EC2_INSTANCE_ID }}
@@ -236,7 +262,8 @@ jobs:
               "docker pull 048280526216.dkr.ecr.us-east-1.amazonaws.com/githubactions-app:${IMAGE_TAG}",
               "docker stop ${CONTAINER_NAME} || true",
               "docker rm ${CONTAINER_NAME} || true",
-              "docker run -d --name ${CONTAINER_NAME} -p ${APP_PORT}:5000 048280526216.dkr.ecr.us-east-1.amazonaws.com/githubactions-app:${IMAGE_TAG}"
+              "docker run -d --name ${CONTAINER_NAME} -p ${APP_PORT}:5000 048280526216.dkr.ecr.us-east-1.amazonaws.com/githubactions-app:${IMAGE_TAG}",
+              "echo ${IMAGE_TAG} > /home/ec2-user/current-production-tag.txt"
             ]
           }
           EOF
@@ -251,6 +278,7 @@ jobs:
           STATUS=$(aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --region us-west-2 --query "Status" --output text)
           aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --region us-west-2
           if [ "$STATUS" != "Success" ]; then exit 1; fi
+
       - name: Get instance public IP
         id: get-ip
         env:
@@ -258,9 +286,47 @@ jobs:
         run: |
           IP=$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" --region us-west-2 --query "Reservations[0].Instances[0].PublicIpAddress" --output text)
           echo "ip=$IP" >> "$GITHUB_OUTPUT"
+
       - name: Health check
+        id: health-check
+        continue-on-error: true
         env:
           APP_PORT: ${{ vars.APP_PORT }}
         run: |
           sleep 10
           curl -f http://${{ steps.get-ip.outputs.ip }}:${APP_PORT}
+
+      - name: Roll back to previous image on failed health check
+        if: steps.health-check.outcome == 'failure' && steps.get-previous.outputs.prev_tag != 'none'
+        env:
+          INSTANCE_ID: ${{ secrets.EC2_INSTANCE_ID }}
+          PREV_TAG: ${{ steps.get-previous.outputs.prev_tag }}
+          APP_PORT: ${{ vars.APP_PORT }}
+          CONTAINER_NAME: ${{ vars.CONTAINER_NAME }}
+        run: |
+          echo "Health check failed for new image. Rolling back production to previous tag: $PREV_TAG"
+          cat <<EOF > rollback-commands.json
+          {
+            "commands": [
+              "docker stop ${CONTAINER_NAME} || true",
+              "docker rm ${CONTAINER_NAME} || true",
+              "docker run -d --name ${CONTAINER_NAME} -p ${APP_PORT}:5000 048280526216.dkr.ecr.us-east-1.amazonaws.com/githubactions-app:${PREV_TAG}",
+              "echo ${PREV_TAG} > /home/ec2-user/current-production-tag.txt"
+            ]
+          }
+          EOF
+          COMMAND_ID=$(aws ssm send-command \
+            --document-name "AWS-RunShellScript" \
+            --targets "Key=instanceIds,Values=$INSTANCE_ID" \
+            --parameters file://rollback-commands.json \
+            --region us-west-2 \
+            --query "Command.CommandId" \
+            --output text)
+          aws ssm wait command-executed --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --region us-west-2 || true
+          aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --region us-west-2
+
+      - name: Fail the job — new image was bad even though service was restored
+        if: steps.health-check.outcome == 'failure'
+        run: |
+          echo "Production deploy failed its health check. Automatic rollback restored the previous known-good image."
+          exit 1
